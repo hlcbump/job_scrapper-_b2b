@@ -1,0 +1,391 @@
+from playwright.sync_api import sync_playwright
+import time
+import pandas as pd
+from datetime import datetime
+import re
+import requests
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY")
+AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
+AIRTABLE_COMPANIES_TABLE = os.getenv("AIRTABLE_COMPANIES_TABLE", "Companies")
+AIRTABLE_JOBS_TABLE = os.getenv("AIRTABLE_JOBS_TABLE", "Jobs")
+
+print("🔐 Token prefix:", (AIRTABLE_API_KEY or "")[:10])
+
+
+def airtable_request(method, table_name, json_data=None, params=None):
+    """Small wrapper around Airtable HTTP API."""
+    if not AIRTABLE_API_KEY or not AIRTABLE_BASE_ID:
+        raise RuntimeError("AIRTABLE_API_KEY or AIRTABLE_BASE_ID not set")
+
+    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{table_name}"
+    headers = {
+        "Authorization": f"Bearer {AIRTABLE_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    resp = requests.request(
+        method, url, headers=headers, json=json_data, params=params, timeout=30
+    )
+
+    if not resp.ok:
+        print(
+            f"⚠️ Airtable error [{method} {table_name}]: "
+            f"{resp.status_code} {resp.text}"
+        )
+
+    return resp.json()
+
+
+def load_existing_companies():
+    companies_by_name = {}
+    offset = None
+    total = 0
+
+    while True:
+        params = {"pageSize": 100}
+        if offset:
+            params["offset"] = offset
+
+        data = airtable_request("GET", AIRTABLE_COMPANIES_TABLE, params=params)
+
+        for rec in data.get("records", []):
+            fields = rec.get("fields", {})
+            name = fields.get("company_name", "")
+            if not name:
+                continue
+            key = name.strip().lower()
+            companies_by_name[key] = rec["id"]
+            total += 1
+
+        offset = data.get("offset")
+        if not offset:
+            break
+
+    print(f"📊 Loaded {total} companies from Airtable")
+    return companies_by_name
+
+
+def load_existing_jobs():
+    jobs_by_url = set()
+    offset = None
+    total = 0
+
+    while True:
+        params = {"pageSize": 100}
+        if offset:
+            params["offset"] = offset
+
+        data = airtable_request("GET", AIRTABLE_JOBS_TABLE, params=params)
+
+        for rec in data.get("records", []):
+            fields = rec.get("fields", {})
+            url = fields.get("job_url")
+            if url:
+                jobs_by_url.add(url.strip())
+                total += 1
+
+        offset = data.get("offset")
+        if not offset:
+            break
+
+    print(f"📊 Loaded {total} jobs from Airtable")
+    return jobs_by_url
+
+
+def create_company(company_record):
+    payload = {"records": [{"fields": company_record}]}
+    data = airtable_request("POST", AIRTABLE_COMPANIES_TABLE, json_data=payload)
+
+    try:
+        record = data["records"][0]
+        company_id = record["id"]
+        print(f"✅ Created new company: {record['fields'].get('company_name')}")
+        return company_id
+    except Exception:
+        print(f"⚠️ Unexpected response when creating company: {data}")
+        return None
+
+
+def create_job(job_record, company_id):
+    if not company_id:
+        print("⚠️ Skipping job creation: company_id is None")
+        return
+
+    fields = dict(job_record)
+    fields["company"] = [company_id]
+
+    payload = {"records": [{"fields": fields}]}
+    data = airtable_request("POST", AIRTABLE_JOBS_TABLE, json_data=payload)
+
+    try:
+        record = data["records"][0]
+        print(f"💼 Job added: {record['fields'].get('job_title')}")
+    except Exception:
+        print(f"⚠️ Unexpected response when creating job: {data}")
+
+
+EMAIL_BLACKLIST_SUBSTRINGS = [
+    "example@",
+    "no-reply@",
+    "@sentry.",
+    "core-js-bundle@",
+    "react@",
+    "react-dom@",
+    "lodash@",
+    "intl-segmenter@",
+    "focus-within-polyfill@",
+    "user@example.com",
+]
+
+
+def extract_emails_from_html(html: str):
+    """Extract and filter emails from raw HTML."""
+    emails = re.findall(
+        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", html, flags=re.IGNORECASE
+    )
+    cleaned = []
+    for e in emails:
+        if any(bad in e for bad in EMAIL_BLACKLIST_SUBSTRINGS):
+            continue
+        cleaned.append(e.lower())
+    seen = set()
+    final = []
+    for e in cleaned:
+        if e not in seen:
+            seen.add(e)
+            final.append(e)
+    return final
+
+
+def find_internal_links(page, base_url: str):
+    anchors = page.query_selector_all("a[href]")
+    internal = []
+    base_domain = base_url.split("/")[2] if "://" in base_url else base_url
+
+    for a in anchors:
+        href = a.get_attribute("href")
+        if not href:
+            continue
+
+        lower = href.lower()
+        if not any(
+            k in lower for k in ["contact", "about", "support", "team", "impressum"]
+        ):
+            continue
+
+        # normalizar URL relativa
+        if href.startswith("/"):
+            href = f"{base_url.rstrip('/')}{href}"
+
+        if base_domain in href:
+            internal.append(href)
+
+    # remove dupes, limit a 3
+    unique = list(dict.fromkeys(internal))[:3]
+    return unique
+
+
+def run_once():
+    print("🌐 Accessing Backpacker Job Board...")
+
+    companies_by_name = load_existing_companies()
+    jobs_by_url = load_existing_jobs()
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        context = browser.new_context()
+        page = context.new_page()
+
+        page.goto(
+            "https://www.backpackerjobboard.com.au/", wait_until="domcontentloaded"
+        )
+        page.wait_for_load_state("load")
+        time.sleep(2)
+
+        print("🧱 Looking for the 'Labourer Jobs' link...")
+        page.wait_for_selector("a[href*='/jobs/labour-trade/']", timeout=45000)
+        page.click("a[href*='/jobs/labour-trade/']")
+        page.wait_for_url("**/jobs/labour-trade/**", timeout=45000)
+        page.wait_for_load_state("load")
+        time.sleep(1)
+
+        print("📋 Collecting job listings...")
+        page.wait_for_selector("div.jobs-list", timeout=45000)
+        jobs = page.query_selector_all("div.jobs-list .job-entry")
+        print(f"✅ Total jobs found: {len(jobs)}")
+
+        print("\n🔗 Collecting job links and metadata...")
+        job_items = []
+        for job in jobs:
+            title_el = job.query_selector("h3.job-title a")
+            company_el = job.query_selector(
+                "p.job-company span span"
+            ) or job.query_selector("p.job-company")
+            location_el = job.query_selector("p.job-location")
+            category_el = job.query_selector("p.job-category span")
+
+            title = title_el.inner_text().strip() if title_el else ""
+            company_name = company_el.inner_text().strip() if company_el else ""
+            location = (
+                location_el.inner_text().strip().replace("\n", " ")
+                if location_el
+                else ""
+            )
+            category = category_el.inner_text().strip() if category_el else ""
+
+            href = title_el.get_attribute("href") if title_el else ""
+            if href and href.startswith("/"):
+                href = f"https://www.backpackerjobboard.com.au{href}"
+
+            job_items.append(
+                {
+                    "job_title": title,
+                    "company_name": company_name,
+                    "job_location": location,
+                    "category": category,
+                    "job_url": href,
+                }
+            )
+
+        if job_items:
+            print(f"✅ Links collected: {len(job_items)}")
+            print("Example:", [j["job_url"] for j in job_items[:3]])
+
+        print("\n🧭 Visiting job details and company websites...\n")
+
+        for idx, job_info in enumerate(job_items, start=1):
+            job_url = job_info["job_url"]
+            title = job_info["job_title"]
+            company_name = job_info["company_name"]
+            location = job_info["job_location"]
+            category = job_info["category"]
+
+            print(f"➡️  ({idx}/{len(job_items)}) Opening job: {job_url}")
+
+            if job_url and job_url in jobs_by_url:
+                print(f"🔄 Job already exists: {title}")
+                continue
+
+            company_key = company_name.strip().lower() if company_name else ""
+            existing_company_id = companies_by_name.get(company_key)
+
+            scraped_at = datetime.utcnow().isoformat()
+
+            if existing_company_id:
+                print(f"🔄 Company already exists: {company_name}")
+                job_record = {
+                    "job_title": title,
+                    "job_location": location,
+                    "job_url": job_url,
+                    "category": category,
+                    "scraped_at_utc": scraped_at,
+                }
+                create_job(job_record, existing_company_id)
+                jobs_by_url.add(job_url)
+                continue
+
+            detail = context.new_page()
+            try:
+                detail.goto(job_url, wait_until="domcontentloaded", timeout=45000)
+                time.sleep(1)
+
+                employer_profile = detail.query_selector("div.employer-profile")
+                if not employer_profile:
+                    print("❌ No employer profile block found.")
+                    detail.close()
+                    continue
+
+                site_el = employer_profile.query_selector("a[href^='http']")
+                if not site_el:
+                    print("❌ No company website link found in employer profile.")
+                    detail.close()
+                    continue
+
+                site_url = site_el.get_attribute("href")
+                if not site_url or "backpackerjobboard.com.au" in site_url:
+                    print("ℹ️ Company website link is internal or invalid.")
+                    detail.close()
+                    continue
+
+                print(f"🌐 Company website found: {site_url}")
+
+                company_page = context.new_page()
+                try:
+                    company_page.goto(
+                        site_url, wait_until="domcontentloaded", timeout=45000
+                    )
+                    time.sleep(1)
+
+                    internal_links = find_internal_links(company_page, site_url)
+                    print(f"🔗 Relevant internal pages: {internal_links}")
+
+                    emails = extract_emails_from_html(company_page.content())
+
+                    for internal_url in internal_links:
+                        try:
+                            company_page.goto(
+                                internal_url,
+                                wait_until="domcontentloaded",
+                                timeout=45000,
+                            )
+                            time.sleep(0.5)
+                            emails += extract_emails_from_html(company_page.content())
+                        except Exception:
+                            continue
+
+                    emails = list(dict.fromkeys(emails))
+                    if not emails:
+                        print("❌ No public emails found.")
+                        continue
+
+                    print(f"📧 Public emails found: {emails}")
+
+                    company_record = {
+                        "company_name": company_name,
+                        "company_website": site_url,
+                        "emails_found": ", ".join(emails),
+                        "scraped_at_utc": scraped_at,
+                    }
+                    new_company_id = create_company(company_record)
+                    if not new_company_id:
+                        continue
+
+                    companies_by_name[company_key] = new_company_id
+
+                    job_record = {
+                        "job_title": title,
+                        "job_location": location,
+                        "job_url": job_url,
+                        "category": category,
+                        "scraped_at_utc": scraped_at,
+                    }
+                    create_job(job_record, new_company_id)
+                    jobs_by_url.add(job_url)
+
+                except Exception as e:
+                    print(f"⚠️ Error while visiting company site: {e}")
+                finally:
+                    try:
+                        company_page.close()
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                print(f"⚠️ Error while opening job detail {job_url}: {e}")
+            finally:
+                try:
+                    detail.close()
+                except Exception:
+                    pass
+
+        context.close()
+        browser.close()
+
+
+if __name__ == "__main__":
+    run_once()
