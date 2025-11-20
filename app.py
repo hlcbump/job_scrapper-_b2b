@@ -1,11 +1,12 @@
 from playwright.sync_api import sync_playwright
 import time
-import pandas as pd
 from datetime import datetime
 import re
 import requests
 import os
 from dotenv import load_dotenv
+import dns.resolver
+import socket
 
 load_dotenv()
 
@@ -13,6 +14,8 @@ AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
 AIRTABLE_COMPANIES_TABLE = os.getenv("AIRTABLE_COMPANIES_TABLE", "Companies")
 AIRTABLE_JOBS_TABLE = os.getenv("AIRTABLE_JOBS_TABLE", "Jobs")
+AIRTABLE_CONTACTS_TABLE = os.getenv("AIRTABLE_CONTACTS_TABLE", "Contacts")
+
 
 print("🔐 Token prefix:", (AIRTABLE_API_KEY or "")[:10])
 
@@ -190,6 +193,80 @@ def find_internal_links(page, base_url: str):
     return unique
 
 
+def validate_email_syntax(email: str):
+    pattern = r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"
+    return re.match(pattern, email) is not None
+
+
+def validate_mx_records(domain: str):
+    try:
+        answers = dns.resolver.resolve(domain, "MX")
+        return [str(r.exchange).rstrip(".") for r in answers]
+    except Exception:
+        return None
+
+
+def smtp_zero_handshake(mx_host: str):
+    try:
+        server = socket.create_connection((mx_host, 25), timeout=1)
+        server.close()
+        return True
+    except Exception:
+        return False
+
+
+def validate_email(email: str):
+    if not validate_email_syntax(email):
+        return {"status": "syntax_error", "mx": None}
+
+    domain = email.split("@")[1]
+
+    mx_records = validate_mx_records(domain)
+    if not mx_records:
+        return {"status": "invalid_mx", "mx": None}
+
+    handshake_ok = smtp_zero_handshake(mx_records[0])
+
+    return {
+        "status": "smtp_verified" if handshake_ok else "valid_mx",
+        "mx": mx_records,
+    }
+
+
+def create_contact(email, source_url, company_id, validation, scraped_at):
+    record = {
+        "email": email,
+        "source_url": source_url,
+        "company": [company_id],
+        "verification_status": validation["status"],
+        "mx_records": ", ".join(validation["mx"]) if validation["mx"] else "",
+        "created_at_utc": scraped_at,
+    }
+
+    payload = {"records": [{"fields": record}]}
+    resp = airtable_request("POST", AIRTABLE_CONTACTS_TABLE, json_data=payload)
+
+    if "records" in resp:
+        print(f"📇 Contact added: {email}")
+    else:
+        print("⚠️ Failed to create contact:", resp)
+
+
+def choose_primary_email(email_list):
+    priority = ["jobs@", "careers@", "hr@", "talent@"]
+    secondary = ["contact@", "info@"]
+
+    for e in email_list:
+        if any(p in e for p in priority):
+            return e
+
+    for e in email_list:
+        if any(s in e for s in secondary):
+            return e
+
+    return email_list[0]
+
+
 def run_once():
     print("🌐 Accessing Backpacker Job Board...")
 
@@ -274,7 +351,7 @@ def run_once():
             company_key = company_name.strip().lower() if company_name else ""
             existing_company_id = companies_by_name.get(company_key)
 
-            scraped_at = datetime.utcnow().isoformat()
+            scraped_at = datetime.utcnow().strftime("%Y-%m-%d")
 
             if existing_company_id:
                 print(f"🔄 Company already exists: {company_name}")
@@ -344,6 +421,9 @@ def run_once():
                         continue
 
                     print(f"📧 Public emails found: {emails}")
+                    # -----------------------------------------
+                    # Milestone 2: Email validation + Contacts
+                    # -----------------------------------------
 
                     company_record = {
                         "company_name": company_name,
@@ -356,6 +436,40 @@ def run_once():
                         continue
 
                     companies_by_name[company_key] = new_company_id
+                    validated_emails = []
+
+                    for email in emails:
+                        validation = validate_email(email)
+                        create_contact(
+                            email=email,
+                            source_url=site_url,
+                            company_id=new_company_id,
+                            validation=validation,
+                            scraped_at=scraped_at,
+                        )
+                        validated_emails.append(email)
+
+                    # Choose primary email for outreach
+                    primary_email = choose_primary_email(validated_emails)
+
+                    # Update company with primary email + status
+                    airtable_request(
+                        "PATCH",
+                        AIRTABLE_COMPANIES_TABLE,
+                        json_data={
+                            "records": [
+                                {
+                                    "id": new_company_id,
+                                    "fields": {
+                                        "primary_contact_email": primary_email,
+                                        "email_discovery_status": "completed",
+                                    },
+                                }
+                            ]
+                        },
+                    )
+
+                    print(f"🏆 Primary contact set: {primary_email}")
 
                     job_record = {
                         "job_title": title,
