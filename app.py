@@ -4,9 +4,28 @@ from datetime import datetime
 import re
 import requests
 import os
+import sys
 from dotenv import load_dotenv
 import dns.resolver
 import socket
+
+LOCKFILE = "/tmp/job_scraper.lock"
+
+if os.path.exists(LOCKFILE):
+    with open(LOCKFILE, "r") as f:
+        old_pid = f.read().strip()
+
+    # if PID exists AND is python AND running this script, exit
+    if old_pid.isdigit() and os.path.exists(f"/proc/{old_pid}"):
+        print("❌ Another instance is already running. Exiting.")
+        sys.exit(0)
+    else:
+        print("⚠️ Stale lockfile found. Removing...")
+        os.remove(LOCKFILE)
+
+
+with open(LOCKFILE, "w") as f:
+    f.write(str(os.getpid()))
 
 load_dotenv()
 
@@ -502,4 +521,8 @@ def run_once():
 
 
 if __name__ == "__main__":
-    run_once()
+    try:
+        run_once()
+    finally:
+        if os.path.exists(LOCKFILE):
+            os.remove(LOCKFILE)
