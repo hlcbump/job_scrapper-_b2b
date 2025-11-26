@@ -8,19 +8,20 @@ import sys
 from dotenv import load_dotenv
 import dns.resolver
 import socket
+import psutil
 
 LOCKFILE = "/tmp/job_scraper.lock"
 
+# Verificar lockfile
 if os.path.exists(LOCKFILE):
     with open(LOCKFILE, "r") as f:
         old_pid = f.read().strip()
 
-    # if PID exists AND is python AND running this script, exit
-    if old_pid.isdigit() and os.path.exists(f"/proc/{old_pid}"):
+    if old_pid.isdigit() and psutil.pid_exists(int(old_pid)):
         print("❌ Another instance is already running. Exiting.")
         sys.exit(0)
     else:
-        print("⚠️ Stale lockfile found. Removing...")
+        print("⚠️ Removing stale lockfile")
         os.remove(LOCKFILE)
 
 
