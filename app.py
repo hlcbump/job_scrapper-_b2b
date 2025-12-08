@@ -220,7 +220,7 @@ def validate_email_syntax(email: str):
 
 def validate_mx_records(domain: str):
     try:
-        answers = dns.resolver.resolve(domain, "MX")
+        answers = dns.resolver.resolve(domain, "MX", lifetime=2)
         return [str(r.exchange).rstrip(".") for r in answers]
     except Exception:
         return None
@@ -298,18 +298,19 @@ def run_once():
         context = browser.new_context()
         page = context.new_page()
 
+        context.set_default_timeout(15000)  # 15 segundos
+        context.set_default_navigation_timeout(15000)
+
         page.goto(
             "https://www.backpackerjobboard.com.au/", wait_until="domcontentloaded"
         )
-        page.wait_for_load_state("load")
-        time.sleep(2)
+        page.wait_for_load_state("networkidle")
 
         print("🧱 Looking for the 'Labourer Jobs' link...")
         page.wait_for_selector("a[href*='/jobs/labour-trade/']", timeout=45000)
         page.click("a[href*='/jobs/labour-trade/']")
         page.wait_for_url("**/jobs/labour-trade/**", timeout=45000)
-        page.wait_for_load_state("load")
-        time.sleep(1)
+        page.wait_for_load_state("networkidle")
 
         print("📋 Collecting job listings...")
         page.wait_for_selector("div.jobs-list", timeout=45000)
@@ -389,7 +390,6 @@ def run_once():
             detail = context.new_page()
             try:
                 detail.goto(job_url, wait_until="domcontentloaded", timeout=45000)
-                time.sleep(1)
 
                 employer_profile = detail.query_selector("div.employer-profile")
                 if not employer_profile:
@@ -409,6 +409,18 @@ def run_once():
                     detail.close()
                     continue
 
+                if site_url.startswith("http://https://"):
+                    site_url = site_url.replace("http://https://", "https://")
+
+                if site_url.startswith("https://https://"):
+                    site_url = site_url.replace("https://https://", "https://")
+
+                if site_url.startswith("http//"):
+                    site_url = "http://" + site_url[5:]
+
+                if "https//" in site_url and "https://" not in site_url:
+                    site_url = site_url.replace("https//", "https://")
+
                 print(f"🌐 Company website found: {site_url}")
 
                 company_page = context.new_page()
@@ -416,7 +428,6 @@ def run_once():
                     company_page.goto(
                         site_url, wait_until="domcontentloaded", timeout=45000
                     )
-                    time.sleep(1)
 
                     internal_links = find_internal_links(company_page, site_url)
                     print(f"🔗 Relevant internal pages: {internal_links}")
@@ -430,7 +441,6 @@ def run_once():
                                 wait_until="domcontentloaded",
                                 timeout=45000,
                             )
-                            time.sleep(0.5)
                             emails += extract_emails_from_html(company_page.content())
                         except Exception:
                             continue
