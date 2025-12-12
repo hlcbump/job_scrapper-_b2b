@@ -304,13 +304,19 @@ def run_once():
         page.goto(
             "https://www.backpackerjobboard.com.au/", wait_until="domcontentloaded"
         )
-        page.wait_for_load_state("networkidle")
+        try:
+            page.wait_for_load_state("networkidle", timeout=5000)
+        except:
+            page.wait_for_load_state("domcontentloaded")
 
         print("🧱 Looking for the 'Labourer Jobs' link...")
         page.wait_for_selector("a[href*='/jobs/labour-trade/']", timeout=45000)
         page.click("a[href*='/jobs/labour-trade/']")
         page.wait_for_url("**/jobs/labour-trade/**", timeout=45000)
-        page.wait_for_load_state("networkidle")
+        try:
+            page.wait_for_load_state("networkidle", timeout=5000)
+        except:
+            page.wait_for_load_state("domcontentloaded")
 
         print("📋 Collecting job listings...")
         page.wait_for_selector("div.jobs-list", timeout=45000)
