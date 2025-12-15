@@ -154,7 +154,19 @@ def create_job(job_record, company_id):
 
 EMAIL_BLACKLIST_SUBSTRINGS = [
     "example@",
+    "user@domain",
+    "admin@domain",
+    "@domain.com",
+    "@domain.net",
+    "@example.",
     "no-reply@",
+    "noreply@",
+    "do-not-reply@",
+    "test@",
+    "email@",
+    "yourname@",
+    "your@email",
+    "sample@",
     "@sentry.",
     "core-js-bundle@",
     "react@",
@@ -162,7 +174,6 @@ EMAIL_BLACKLIST_SUBSTRINGS = [
     "lodash@",
     "intl-segmenter@",
     "focus-within-polyfill@",
-    "user@example.com",
 ]
 
 
