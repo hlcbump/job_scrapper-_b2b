@@ -1,5 +1,4 @@
 from playwright.sync_api import sync_playwright
-import time
 from datetime import datetime
 import re
 import requests
@@ -9,8 +8,20 @@ from dotenv import load_dotenv
 import dns.resolver
 import socket
 import psutil
+import signal
+from datetime import datetime, UTC
 
 LOCKFILE = "/tmp/job_scraper.lock"
+MAX_RUNTIME_SECONDS = 5 * 60 * 60  # 5 hours
+
+
+def timeout_handler(signum, frame):
+    print("⏰ Max runtime exceeded, killing process")
+    raise TimeoutError("Max runtime exceeded")
+
+
+signal.signal(signal.SIGALRM, timeout_handler)
+signal.alarm(MAX_RUNTIME_SECONDS)
 
 # Verificar lockfile
 if os.path.exists(LOCKFILE):
@@ -316,7 +327,7 @@ def run_once():
             "https://www.backpackerjobboard.com.au/", wait_until="domcontentloaded"
         )
         try:
-            page.wait_for_load_state("networkidle", timeout=60000)
+            page.wait_for_load_state("networkidle", timeout=10000)
         except:
             page.wait_for_load_state("domcontentloaded")
 
@@ -325,7 +336,7 @@ def run_once():
         page.click("a[href*='/jobs/labour-trade/']")
         page.wait_for_url("**/jobs/labour-trade/**", timeout=60000)
         try:
-            page.wait_for_load_state("networkidle", timeout=60000)
+            page.wait_for_load_state("networkidle", timeout=10000)
         except:
             page.wait_for_load_state("domcontentloaded")
 
@@ -389,7 +400,7 @@ def run_once():
             company_key = company_name.strip().lower() if company_name else ""
             existing_company_id = companies_by_name.get(company_key)
 
-            scraped_at = datetime.utcnow().strftime("%Y-%m-%d")
+            scraped_at = datetime.now(UTC).strftime("%Y-%m-%d")
 
             if existing_company_id:
                 print(f"🔄 Company already exists: {company_name}")
@@ -551,6 +562,9 @@ def run_once():
 if __name__ == "__main__":
     try:
         run_once()
+    except Exception as e:
+        print(f"❌ Fatal error: {e}")
     finally:
+        signal.alarm(0)  # cancela alarme
         if os.path.exists(LOCKFILE):
             os.remove(LOCKFILE)
