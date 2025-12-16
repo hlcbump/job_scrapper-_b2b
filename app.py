@@ -370,6 +370,9 @@ def choose_primary_email(email_list):
 def run_once():
     print("🌐 Accessing Backpacker Job Board...")
 
+    companies_created = 0
+    contacts_created = 0
+
     companies_by_name = load_existing_companies()
     jobs_by_url = load_existing_jobs()
 
