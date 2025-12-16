@@ -10,6 +10,13 @@ import socket
 import psutil
 import signal
 from datetime import datetime, UTC
+import sqlite3
+from contextlib import closing
+
+DASHBOARD_DB_PATH = os.getenv(
+    "DASHBOARD_DB_PATH", "/root/job_scraper/dashboard/data/logs.db"
+)
+
 
 LOCKFILE = "/tmp/job_scraper.lock"
 MAX_RUNTIME_SECONDS = 5 * 60 * 60  # 5 hours
@@ -49,6 +56,55 @@ AIRTABLE_CONTACTS_TABLE = os.getenv("AIRTABLE_CONTACTS_TABLE", "Contacts")
 
 
 print("🔐 Token prefix:", (AIRTABLE_API_KEY or "")[:10])
+
+
+def db_exec(query: str, params: tuple = ()):
+    with closing(sqlite3.connect(DASHBOARD_DB_PATH)) as conn:
+        conn.execute(query, params)
+        conn.commit()
+
+
+def db_query_one(query: str, params: tuple = ()):
+    with closing(sqlite3.connect(DASHBOARD_DB_PATH)) as conn:
+        cur = conn.execute(query, params)
+        return cur.fetchone()
+
+
+def run_log_start():
+    started_at = datetime.now(UTC).isoformat()
+    with closing(sqlite3.connect(DASHBOARD_DB_PATH)) as conn:
+        cur = conn.execute(
+            "INSERT INTO runs (started_at, status) VALUES (?, ?)",
+            (started_at, "running"),
+        )
+        conn.commit()
+        run_id = cur.lastrowid
+    return run_id, started_at
+
+
+def run_log_finish(
+    run_id: int,
+    status: str,
+    jobs_found=0,
+    companies_created=0,
+    contacts_created=0,
+    error_message=None,
+):
+    finished_at = datetime.now(UTC).isoformat()
+    db_exec(
+        """UPDATE runs
+           SET finished_at=?, status=?, jobs_found=?, companies_created=?, contacts_created=?, error_message=?
+           WHERE id=?""",
+        (
+            finished_at,
+            status,
+            jobs_found,
+            companies_created,
+            contacts_created,
+            error_message,
+            run_id,
+        ),
+    )
 
 
 def airtable_request(method, table_name, json_data=None, params=None):
@@ -139,7 +195,7 @@ def create_company(company_record):
         record = data["records"][0]
         company_id = record["id"]
         print(f"✅ Created new company: {record['fields'].get('company_name')}")
-        return company_id
+        return company_id, True
     except Exception:
         print(f"⚠️ Unexpected response when creating company: {data}")
         return None
@@ -290,8 +346,10 @@ def create_contact(email, source_url, company_id, validation, scraped_at):
 
     if "records" in resp:
         print(f"📇 Contact added: {email}")
+        return True
     else:
         print("⚠️ Failed to create contact:", resp)
+        return False
 
 
 def choose_primary_email(email_list):
@@ -489,9 +547,12 @@ def run_once():
                         "emails_found": ", ".join(emails),
                         "scraped_at_utc": scraped_at,
                     }
-                    new_company_id = create_company(company_record)
+                    new_company_id, created = create_company(company_record)
                     if not new_company_id:
                         continue
+
+                    if created:
+                        companies_created += 1
 
                     companies_by_name[company_key] = new_company_id
                     validated_emails = []
@@ -505,6 +566,7 @@ def run_once():
                             validation=validation,
                             scraped_at=scraped_at,
                         )
+                        contacts_created += 1
                         validated_emails.append(email)
 
                     # Choose primary email for outreach
@@ -557,14 +619,29 @@ def run_once():
 
         context.close()
         browser.close()
+        return len(job_items), companies_created, contacts_created
 
 
 if __name__ == "__main__":
+    run_id = None
+    companies_created = 0
+    contacts_created = 0
+    jobs_found = 0
+
     try:
-        run_once()
+        run_id, _ = run_log_start()
+        # ajuste o run_once() para retornar métricas:
+        jobs_found, companies_created, contacts_created = run_once()
+        run_log_finish(
+            run_id, "success", jobs_found, companies_created, contacts_created
+        )
+
     except Exception as e:
         print(f"❌ Fatal error: {e}")
+        if run_id is not None:
+            run_log_finish(run_id, "error", error_message=str(e))
+
     finally:
-        signal.alarm(0)  # cancela alarme
+        signal.alarm(0)
         if os.path.exists(LOCKFILE):
             os.remove(LOCKFILE)
