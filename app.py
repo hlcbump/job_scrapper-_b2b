@@ -215,8 +215,10 @@ def create_job(job_record, company_id):
     try:
         record = data["records"][0]
         print(f"💼 Job added: {record['fields'].get('job_title')}")
+        return True
     except Exception:
         print(f"⚠️ Unexpected response when creating job: {data}")
+        return False
 
 
 EMAIL_BLACKLIST_SUBSTRINGS = [
@@ -372,6 +374,7 @@ def run_once():
 
     companies_created = 0
     contacts_created = 0
+    new_jobs = 0
 
     companies_by_name = load_existing_companies()
     jobs_by_url = load_existing_jobs()
@@ -472,8 +475,10 @@ def run_once():
                     "category": category,
                     "scraped_at_utc": scraped_at,
                 }
-                create_job(job_record, existing_company_id)
-                jobs_by_url.add(job_url)
+                created_job = create_job(job_record, existing_company_id)
+                if created_job:
+                    new_jobs += 1
+                    jobs_by_url.add(job_url)
                 continue
 
             detail = context.new_page()
@@ -601,8 +606,10 @@ def run_once():
                         "category": category,
                         "scraped_at_utc": scraped_at,
                     }
-                    create_job(job_record, new_company_id)
-                    jobs_by_url.add(job_url)
+                    created_job = create_job(job_record, new_company_id)
+                    if created_job:
+                        new_jobs += 1
+                        jobs_by_url.add(job_url)
 
                 except Exception as e:
                     print(f"⚠️ Error while visiting company site: {e}")
@@ -622,7 +629,7 @@ def run_once():
 
         context.close()
         browser.close()
-        return len(job_items), companies_created, contacts_created
+        return new_jobs, companies_created, contacts_created
 
 
 if __name__ == "__main__":
